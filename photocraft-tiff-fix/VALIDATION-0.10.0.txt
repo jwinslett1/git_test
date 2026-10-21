@@ -1,0 +1,12 @@
+PhotoCraft v3 replacements matched to the uploaded PhotoCraft 0.10.0 source ZIP.
+
+Desktop Cargo check: passed (Linux, Rust 1.95).
+Normal tests: 1836 passed, 0 failed, 12 ignored.
+Supplied PTOtigercreek PSD regression: passed separately.
+Strict Clippy, formatting, layering, WebAssembly checks: passed.
+Replacement archive and offline PowerShell helper output: byte-for-byte verified.
+Manifests, lockfiles and unrelated sources: unchanged from uploaded ZIP.
+
+Remaining: original Photoshop TIFF unavailable due to attachment transfer limit;
+Adobe Photoshop open/resave and a Windows build were not executed here.
+Full external corpus remains blocked by previously confirmed PngSuite HTTP 403.
