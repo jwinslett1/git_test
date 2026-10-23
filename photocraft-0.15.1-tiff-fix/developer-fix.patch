@@ -1,0 +1,1072 @@
+diff --git a/crates/codecs/src/codecs/tiff.rs b/crates/codecs/src/codecs/tiff.rs
+index 9528fec9c..fa7b0cd19 100644
+--- a/crates/codecs/src/codecs/tiff.rs
++++ b/crates/codecs/src/codecs/tiff.rs
+@@ -249,7 +249,9 @@ pub(crate) fn decode_page(bytes: &[u8], page: Option<usize>, limits: &Limits) ->
+         .ok_or_else(|| CodecError::InvalidImage(format!("TIFF page {index} does not exist (the file has {} directories)", info.pages.len())))?;
+     let dir = file.ifd(p.ifd_offset).ok_or_else(|| err("image directory cut off"))?;
+     let mut img = decode_ifd(&file, &dir, limits)?;
++    let extra = std::mem::take(&mut img.meta.tiff_extra_samples);
+     img.meta = metadata(&file, &dir, &mut img.icc);
++    img.meta.tiff_extra_samples = extra;
+     let pages = info.page_count();
+     if pages > 1 {
+         img.warnings.push(DecodeWarning::MorePages { total: info.complete.then_some(u32::try_from(pages).unwrap_or(u32::MAX)) });
+@@ -399,8 +401,10 @@ impl Src {
+ }
+ 
+ /// Everything needed to decode and place the chunks of one directory.
++#[derive(Clone)]
+ struct Layout {
+     w: usize,
++    selected_sample: Option<usize>,
+     src: Src,
+     out: SampleType,
+     out_layout: ChannelLayout,
+@@ -431,6 +435,9 @@ impl Layout {
+     }
+     /// The decoded sample (chunky) or file plane (planar) of output channel `k`.
+     fn source_sample(&self, k: usize) -> usize {
++        if let Some(sample) = self.selected_sample {
++            return sample;
++        }
+         if self.out_layout.has_alpha() && k + 1 == self.out_channels() { self.alpha_sample } else { k }
+     }
+     fn out_row(&self) -> usize {
+@@ -442,7 +449,7 @@ impl Layout {
+     }
+     /// Chunk rows are output rows: copied without conversion.
+     fn copyable(&self) -> bool {
+-        !self.planar && self.palette.is_none() && self.src.is_identity() && self.chunk_spp == self.out_channels()
++        self.selected_sample.is_none() && !self.planar && self.palette.is_none() && self.src.is_identity() && self.chunk_spp == self.out_channels()
+     }
+ }
+ 
+@@ -549,7 +556,10 @@ fn decode_ifd(f: &File<'_>, dir: &Ifd, limits: &Limits) -> Result<Image, CodecEr
+         _ => 1,
+     };
+     let alpha_at = extra.iter().position(|&e| e == 1 || e == 2).filter(|&a| (color + a as u64) < spp);
+-    let all_samples = palette.is_none() && matches!(photometric, 2 | 5 | 8 | 9) && alpha_at.is_some_and(|a| a > 0);
++    let extra_indices: Vec<usize> = (color as usize..spp as usize)
++        .filter(|&i| Some(i - color as usize) != alpha_at && !(photometric <= 1 && extra.is_empty() && spp == 2 && i == 1))
++        .collect();
++    let all_samples = palette.is_none() && matches!(photometric, 2 | 5 | 8 | 9) && (alpha_at.is_some_and(|a| a > 0) || !extra_indices.is_empty());
+     let mut patches: Vec<(u64, Vec<u8>)> = Vec::new();
+     let encode_u = |v: u64, len: usize| -> Vec<u8> {
+         let b = if f.le { v.to_le_bytes() } else { v.to_be_bytes() };
+@@ -591,9 +601,15 @@ fn decode_ifd(f: &File<'_>, dir: &Ifd, limits: &Limits) -> Result<Image, CodecEr
+     let (out_layout, chunk_spp) = match ct {
+         _ if palette.is_some() => (ChannelLayout::Rgb, 1),
+         tiff::ColorType::Gray(_) => (ChannelLayout::Gray, 1),
+-        tiff::ColorType::Multiband { num_samples, .. } if all_samples => {
+-            (if photometric == 5 { ChannelLayout::CmykA } else { ChannelLayout::Rgba }, usize::from(num_samples))
+-        }
++        tiff::ColorType::Multiband { num_samples, .. } if all_samples => (
++            match (photometric == 5, alpha_at.is_some()) {
++                (true, true) => ChannelLayout::CmykA,
++                (true, false) => ChannelLayout::Cmyk,
++                (false, true) => ChannelLayout::Rgba,
++                (false, false) => ChannelLayout::Rgb,
++            },
++            usize::from(num_samples),
++        ),
+         tiff::ColorType::Multiband { num_samples, .. } if photometric <= 1 => {
+             (if gray_alpha { ChannelLayout::GrayA } else { ChannelLayout::Gray }, usize::from(num_samples))
+         }
+@@ -663,6 +679,7 @@ fn decode_ifd(f: &File<'_>, dir: &Ifd, limits: &Limits) -> Result<Image, CodecEr
+     let scratch_cap = chunk_bytes.saturating_mul(2).max(64 << 20).min(limits.alloc_usize());
+     let lay = Layout {
+         w: wu,
++        selected_sample: None,
+         src,
+         out,
+         out_layout,
+@@ -696,6 +713,30 @@ fn decode_ifd(f: &File<'_>, dir: &Ifd, limits: &Limits) -> Result<Image, CodecEr
+     if tally.missing > 0 {
+         img.warnings.push(DecodeWarning::Truncated { format: F });
+     }
++    // Decode extra planes with the same bounded strip/tile machinery, including planar TIFFs.
++    // Count all retained samples against the allocation budget before allocating extras.
++    let total_bytes = u64::from(w).saturating_mul(u64::from(h)).saturating_mul(spp).saturating_mul(out.bytes() as u64);
++    if total_bytes > limits.alloc_usize() as u64 {
++        return Err(CodecError::LimitExceeded("TIFF extra samples".into()));
++    }
++    for sample in extra_indices {
++        let plane_layout = Layout {
++            out_layout: ChannelLayout::Gray,
++            selected_sample: Some(sample),
++            planes: 1,
++            invert: false,
++            premultiplied: false,
++            palette: None,
++            ..lay.clone()
++        };
++        let row = plane_layout.out_row();
++        let mut plane = zeroed(row.checked_mul(hu).ok_or_else(|| err("extra plane size"))?)?;
++        let tally = decode_bands(&plane_layout, &mut plane, row * ch.min(hu), &mut dec, &open)?;
++        if tally.missing > 0 {
++            return Err(err("TIFF extra sample data is truncated"));
++        }
++        img.meta.tiff_extra_samples.push(plane);
++    }
+     Ok(img)
+ }
+ 
+@@ -800,7 +841,7 @@ fn decode_band(lay: &Layout, dec: &mut Decoder<Patched<'_>>, scratch: &mut Vec<u
+     let px = lay.out_channels() * lay.out.bytes();
+     let mut tally = Tally::default();
+     for plane in 0..lay.planes {
+-        let file_plane = lay.source_sample(plane);
++        let file_plane = if lay.planar { lay.source_sample(plane) } else { 0 };
+         for col in 0..lay.across {
+             let chunk = file_plane
+                 .checked_mul(lay.chunks_per_plane)
+@@ -1061,6 +1102,20 @@ macro_rules! custom_colortype {
+ }
+ 
+ use PhotometricInterpretation as PI;
++// RGB plus straight transparency and one unspecified (spot) sample.
++custom_colortype!(RgbExtra8, u8, PI::RGB, &[8; 4], &[SampleFormat::Uint; 4], int);
++custom_colortype!(RgbExtra16, u16, PI::RGB, &[16; 4], &[SampleFormat::Uint; 4], int);
++custom_colortype!(RgbExtra32F, f32, PI::RGB, &[32; 4], &[SampleFormat::IEEEFP; 4], float);
++custom_colortype!(RgbSpot8, u8, PI::RGB, &[8; 5], &[SampleFormat::Uint; 5], int);
++custom_colortype!(RgbSpot16, u16, PI::RGB, &[16; 5], &[SampleFormat::Uint; 5], int);
++custom_colortype!(RgbSpot32F, f32, PI::RGB, &[32; 5], &[SampleFormat::IEEEFP; 5], float);
++// CMYK has four colour samples; transparency and spot remain separate extras.
++custom_colortype!(CmykExtra8, u8, PI::CMYK, &[8; 5], &[SampleFormat::Uint; 5], int);
++custom_colortype!(CmykExtra16, u16, PI::CMYK, &[16; 5], &[SampleFormat::Uint; 5], int);
++custom_colortype!(CmykExtra32F, f32, PI::CMYK, &[32; 5], &[SampleFormat::IEEEFP; 5], float);
++custom_colortype!(CmykSpot8, u8, PI::CMYK, &[8; 6], &[SampleFormat::Uint; 6], int);
++custom_colortype!(CmykSpot16, u16, PI::CMYK, &[16; 6], &[SampleFormat::Uint; 6], int);
++custom_colortype!(CmykSpot32F, f32, PI::CMYK, &[32; 6], &[SampleFormat::IEEEFP; 6], float);
+ custom_colortype!(GrayA8, u8, PI::BlackIsZero, &[8, 8], &[SampleFormat::Uint; 2], int);
+ custom_colortype!(GrayA16, u16, PI::BlackIsZero, &[16, 16], &[SampleFormat::Uint; 2], int);
+ custom_colortype!(GrayA32F, f32, PI::BlackIsZero, &[32, 32], &[SampleFormat::IEEEFP; 2], float);
+@@ -1080,6 +1135,7 @@ struct TagSet<'a> {
+     dpi: Option<(f32, f32)>,
+     text: Vec<(Tag, &'a str)>,
+     alpha: bool,
++    spot: bool,
+     photoshop_resources: Option<&'a [u8]>,
+     photoshop_layers: Option<&'a [u8]>,
+ }
+@@ -1109,8 +1165,10 @@ where
+         im.y_resolution(Rational { n: (y * 1000.0).round() as u32, d: 1000 });
+     }
+     let d = im.encoder();
+-    if tags.alpha {
+-        // 2 = unassociated alpha
++    if tags.spot {
++        // 2 = unassociated transparency, 0 = unspecified (Photoshop spot plate).
++        d.write_tag(Tag::ExtraSamples, if tags.alpha { &[2u16, 0u16][..] } else { &[0u16][..] })?;
++    } else if tags.alpha {
+         d.write_tag(Tag::ExtraSamples, &[2u16][..])?;
+     }
+     if let Some(icc) = tags.icc {
+@@ -1187,6 +1245,49 @@ fn write_image<K: TiffKind>(enc: &mut TiffEncoder<&mut Cursor<Vec<u8>>, K>, img:
+     }
+ }
+ 
++fn write_spot<K: TiffKind>(enc: &mut TiffEncoder<&mut Cursor<Vec<u8>>, K>, img: &Image, data: &[u8], tags: &TagSet<'_>) -> tiff::TiffResult<()> {
++    let (w, h) = img.dimensions();
++    match (img.layout().is_cmyk(), tags.alpha, img.sample_type()) {
++        (false, false, SampleType::U8) => write_one::<RgbExtra8, K>(enc, w, h, data, tags),
++        (false, false, SampleType::U16) => {
++            let samples: Vec<u16> = data.chunks_exact(2).map(|b| u16::from_ne_bytes([b[0], b[1]])).collect();
++            write_one::<RgbExtra16, K>(enc, w, h, &samples, tags)
++        }
++        (false, false, SampleType::F32) => {
++            let samples: Vec<f32> = data.chunks_exact(4).map(|b| f32::from_ne_bytes([b[0], b[1], b[2], b[3]])).collect();
++            write_one::<RgbExtra32F, K>(enc, w, h, &samples, tags)
++        }
++        (false, true, SampleType::U8) => write_one::<RgbSpot8, K>(enc, w, h, data, tags),
++        (false, true, SampleType::U16) => {
++            let samples: Vec<u16> = data.chunks_exact(2).map(|b| u16::from_ne_bytes([b[0], b[1]])).collect();
++            write_one::<RgbSpot16, K>(enc, w, h, &samples, tags)
++        }
++        (false, true, SampleType::F32) => {
++            let samples: Vec<f32> = data.chunks_exact(4).map(|b| f32::from_ne_bytes([b[0], b[1], b[2], b[3]])).collect();
++            write_one::<RgbSpot32F, K>(enc, w, h, &samples, tags)
++        }
++        (true, false, SampleType::U8) => write_one::<CmykExtra8, K>(enc, w, h, data, tags),
++        (true, false, SampleType::U16) => {
++            let samples: Vec<u16> = data.chunks_exact(2).map(|b| u16::from_ne_bytes([b[0], b[1]])).collect();
++            write_one::<CmykExtra16, K>(enc, w, h, &samples, tags)
++        }
++        (true, false, SampleType::F32) => {
++            let samples: Vec<f32> = data.chunks_exact(4).map(|b| f32::from_ne_bytes([b[0], b[1], b[2], b[3]])).collect();
++            write_one::<CmykExtra32F, K>(enc, w, h, &samples, tags)
++        }
++        (true, true, SampleType::U8) => write_one::<CmykSpot8, K>(enc, w, h, data, tags),
++        (true, true, SampleType::U16) => {
++            let samples: Vec<u16> = data.chunks_exact(2).map(|b| u16::from_ne_bytes([b[0], b[1]])).collect();
++            write_one::<CmykSpot16, K>(enc, w, h, &samples, tags)
++        }
++        (true, true, SampleType::F32) => {
++            let samples: Vec<f32> = data.chunks_exact(4).map(|b| f32::from_ne_bytes([b[0], b[1], b[2], b[3]])).collect();
++            write_one::<CmykSpot32F, K>(enc, w, h, &samples, tags)
++        }
++        _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "unsupported spot sample depth").into()),
++    }
++}
++
+ /// Classic TIFF offsets are 32-bit: a file that may grow past this is written as BigTIFF.
+ const CLASSIC_LIMIT: u64 = u32::MAX as u64;
+ 
+@@ -1203,6 +1304,33 @@ fn estimated_size(img: &Image, tags: &TagSet<'_>) -> u64 {
+ 
+ pub(crate) fn encode(src: &Image, plan: Plan, opts: &EncodeOptions) -> Result<Vec<u8>, CodecError> {
+     let img = src.converted(plan.layout, plan.sample);
++    encode_impl(&img, opts, None)
++}
++
++/// Encodes RGB or CMYK, optional straight alpha, and one spot plate. `extra` is a single
++/// sample plane, with one sample per pixel in the same native sample type as `src`.
++pub(crate) fn encode_spot(src: &Image, extra: &[u8], opts: &EncodeOptions) -> Result<Vec<u8>, CodecError> {
++    if (!src.layout().is_rgb() && !src.layout().is_cmyk()) || src.sample_type() == SampleType::F16 {
++        return Err(CodecError::unsupported(F, "spot TIFF requires RGB/RGBA or CMYK/CMYKA at 8, 16 or 32 bits"));
++    }
++    let bytes = src.sample_type().bytes();
++    let count = src.pixel_count();
++    let plane_len = count.checked_mul(bytes).ok_or_else(|| CodecError::LimitExceeded("spot plane size".into()))?;
++    if extra.len() != plane_len {
++        return Err(CodecError::unsupported(F, "spot sample plane has incorrect length"));
++    }
++    let pixel_bytes = src.layout().channels() * bytes;
++    let mut data = Vec::new();
++    let len = count.checked_mul(pixel_bytes + bytes).ok_or_else(|| CodecError::LimitExceeded("spot TIFF size".into()))?;
++    data.try_reserve_exact(len).map_err(|_| CodecError::LimitExceeded("spot TIFF allocation".into()))?;
++    for (pixel, spot) in src.data().chunks_exact(pixel_bytes).zip(extra.chunks_exact(bytes)) {
++        data.extend_from_slice(pixel);
++        data.extend_from_slice(spot);
++    }
++    encode_impl(src, opts, Some(&data))
++}
++
++fn encode_impl(img: &Image, opts: &EncodeOptions, spot_data: Option<&[u8]>) -> Result<Vec<u8>, CodecError> {
+     let compression = match opts.tiff_compression {
+         TiffCompression::None => tiff::encoder::Compression::Uncompressed,
+         TiffCompression::Lzw => tiff::encoder::Compression::Lzw,
+@@ -1233,6 +1361,7 @@ pub(crate) fn encode(src: &Image, plan: Plan, opts: &EncodeOptions) -> Result<Ve
+         dpi: if opts.embed_metadata { img.meta.dpi.filter(|d| d.0 > 0.0 && d.1 > 0.0) } else { None },
+         text,
+         alpha: img.layout().has_alpha(),
++        spot: spot_data.is_some(),
+         // Document content, not metadata: written whenever present.
+         photoshop_resources: img.meta.photoshop_resources.as_deref().filter(|r| !r.is_empty()),
+         photoshop_layers: img.meta.photoshop_layers.as_deref().filter(|l| !l.is_empty()),
+@@ -1245,14 +1374,22 @@ pub(crate) fn encode(src: &Image, plan: Plan, opts: &EncodeOptions) -> Result<Ve
+         let mut cursor = Cursor::new(Vec::new());
+         if big {
+             let mut enc = TiffEncoder::new_big(&mut cursor)?.with_compression(compression).with_predictor(predictor);
+-            write_image::<TiffKindBig>(&mut enc, &img, &tags)?;
++            if let Some(data) = spot_data {
++                write_spot::<TiffKindBig>(&mut enc, img, data, &tags)?;
++            } else {
++                write_image::<TiffKindBig>(&mut enc, img, &tags)?;
++            }
+         } else {
+             let mut enc = TiffEncoder::new(&mut cursor)?.with_compression(compression).with_predictor(predictor);
+-            write_image::<TiffKindStandard>(&mut enc, &img, &tags)?;
++            if let Some(data) = spot_data {
++                write_spot::<TiffKindStandard>(&mut enc, img, data, &tags)?;
++            } else {
++                write_image::<TiffKindStandard>(&mut enc, img, &tags)?;
++            }
+         }
+         Ok(cursor.into_inner())
+     };
+-    let big = opts.tiff_bigtiff || estimated_size(&img, &tags) > CLASSIC_LIMIT;
++    let big = opts.tiff_bigtiff || estimated_size(img, &tags).saturating_add(spot_data.map_or(0, |d| d.len() as u64)) > CLASSIC_LIMIT;
+     match write(big) {
+         Ok(v) => Ok(v),
+         Err(tiff::TiffError::IntSizeError) if !big => write(true).map_err(|e| CodecError::encode(F, e)),
+diff --git a/crates/codecs/src/image.rs b/crates/codecs/src/image.rs
+index adc737fee..599461ac3 100644
+--- a/crates/codecs/src/image.rs
++++ b/crates/codecs/src/image.rs
+@@ -145,6 +145,9 @@ pub struct Metadata {
+     /// Photoshop layer data (TIFF tag 37724 `ImageSourceData`): a layered TIFF's layers. Kept
+     /// opaque here; `photocraft-io` reads and writes it through `photocraft-psd`.
+     pub photoshop_layers: Option<Vec<u8>>,
++    /// TIFF extra samples other than transparency, in file order. Each plane uses
++    /// the image's native-endian sample type and dimensions; names/types live in 34377.
++    pub tiff_extra_samples: Vec<Vec<u8>>,
+ }
+ 
+ impl Metadata {
+@@ -155,6 +158,7 @@ impl Metadata {
+             && self.text.is_empty()
+             && self.photoshop_resources.is_none()
+             && self.photoshop_layers.is_none()
++            && self.tiff_extra_samples.is_empty()
+     }
+ }
+ 
+diff --git a/crates/codecs/src/lib.rs b/crates/codecs/src/lib.rs
+index cbfc55035..8e1ab58a0 100644
+--- a/crates/codecs/src/lib.rs
++++ b/crates/codecs/src/lib.rs
+@@ -309,3 +309,8 @@ pub fn encode(image: &Image, format: Format, opts: &EncodeOptions) -> Result<Vec
+         Format::Gif | Format::Bmp | Format::Tga | Format::Ico | Format::Qoi | Format::Hdr | Format::Avif => via_image::encode(format, image, plan, opts),
+     }
+ }
++/// Write an RGB/RGBA or CMYK/CMYKA TIFF with one additional unspecified spot sample.
++/// The caller supplies Photoshop channel names and DisplayInfo in image metadata.
++pub fn encode_tiff_spot(image: &Image, spot: &[u8], opts: &EncodeOptions) -> Result<Vec<u8>, CodecError> {
++    codecs::tiff::encode_spot(image, spot, opts)
++}
+diff --git a/crates/codecs/src/orientation.rs b/crates/codecs/src/orientation.rs
+index 3d10d5dde..53c51a240 100644
+--- a/crates/codecs/src/orientation.rs
++++ b/crates/codecs/src/orientation.rs
+@@ -331,6 +331,9 @@ impl Image {
+         }
+         let data = orient_bytes(self.data(), bpp, o, (w, h), ow)?;
+         let mut meta = self.meta.clone();
++        for plane in &mut meta.tiff_extra_samples {
++            *plane = orient_bytes(plane, sample.bytes(), o, (w, h), ow)?;
++        }
+         if let Some(e) = &mut meta.exif
+             && let Cow::Owned(fixed) = upright_exif(e)
+         {
+diff --git a/crates/codecs/tests/tiff_spot.rs b/crates/codecs/tests/tiff_spot.rs
+new file mode 100644
+index 000000000..f50c59c46
+--- /dev/null
++++ b/crates/codecs/tests/tiff_spot.rs
+@@ -0,0 +1,127 @@
++use photocraft_codecs::{ChannelLayout, DecodeOptions, EncodeOptions, Image, SampleType, TiffCompression};
++use std::io::Cursor;
++use tiff::{decoder::Decoder, tags::Tag};
++
++#[test]
++fn spot_is_unspecified_extra_sample_and_keeps_its_polarity() {
++    for alpha in [false, true] {
++        for compression in [TiffCompression::None, TiffCompression::Lzw, TiffCompression::Deflate, TiffCompression::PackBits] {
++            let layout = if alpha { ChannelLayout::Rgba } else { ChannelLayout::Rgb };
++            let pixels = if alpha { vec![10, 20, 30, 0, 40, 50, 60, 127, 70, 80, 90, 255] } else { vec![10, 20, 30, 40, 50, 60, 70, 80, 90] };
++            let image = Image::from_raw(3, 1, layout, SampleType::U8, pixels.clone()).unwrap();
++            let spot = [255, 127, 0]; // Photoshop: no ink, partial ink, full ink.
++            let opts = EncodeOptions { tiff_compression: compression, ..Default::default() };
++            let bytes = photocraft_codecs::encode_tiff_spot(&image, &spot, &opts).unwrap();
++            let mut raw = Decoder::new(Cursor::new(&bytes)).unwrap();
++            assert_eq!(raw.get_tag_u16_vec(Tag::ExtraSamples).unwrap(), if alpha { vec![2, 0] } else { vec![0] });
++            assert_eq!(raw.get_tag_u32(Tag::SamplesPerPixel).unwrap(), if alpha { 5 } else { 4 });
++            let decoded = photocraft_codecs::decode_with(&bytes, &DecodeOptions::default()).unwrap();
++            assert_eq!(decoded.layout(), layout);
++            assert_eq!(decoded.data(), pixels);
++            assert_eq!(decoded.meta.tiff_extra_samples, vec![spot.to_vec()]);
++        }
++    }
++}
++
++#[test]
++fn invalid_spot_buffers_are_errors() {
++    let rgb = Image::from_raw(1, 1, ChannelLayout::Rgb, SampleType::U8, vec![1, 2, 3]).unwrap();
++    assert!(photocraft_codecs::encode_tiff_spot(&rgb, &[], &Default::default()).is_err());
++    assert!(photocraft_codecs::encode_tiff_spot(&rgb, &[1, 2], &Default::default()).is_err());
++    let gray = Image::from_raw(1, 1, ChannelLayout::Gray, SampleType::U8, vec![1]).unwrap();
++    assert!(photocraft_codecs::encode_tiff_spot(&gray, &[1], &Default::default()).is_err());
++}
++
++#[test]
++fn orientation_keeps_spot_registered_with_artwork() {
++    let mut img = Image::from_raw(3, 1, ChannelLayout::Rgb, SampleType::U8, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap();
++    img.meta.tiff_extra_samples = vec![vec![255, 127, 0]];
++    let flipped = img.oriented(2).unwrap();
++    assert_eq!(flipped.data(), [7, 8, 9, 4, 5, 6, 1, 2, 3]);
++    assert_eq!(flipped.meta.tiff_extra_samples, vec![vec![0, 127, 255]]);
++}
++
++#[path = "it/common/tiffgen.rs"]
++mod tiffgen;
++
++#[test]
++fn independent_planar_and_chunky_spot_files_both_byte_orders() {
++    use tiffgen::{Dir, LONG, SHORT, base, build};
++    for little in [false, true] {
++        for big in [false, true] {
++            for planar in [false, true] {
++                for alpha_first in [false, true] {
++                    let extras = if alpha_first { [2, 0] } else { [0, 2] };
++                    let mut planes = vec![vec![10u8, 40], vec![20, 50], vec![30, 60]];
++                    if alpha_first {
++                        planes.extend([vec![0, 127], vec![255, 0]]);
++                    } else {
++                        planes.extend([vec![255, 0], vec![0, 127]]);
++                    }
++                    let chunks = if planar { planes.clone() } else { vec![(0..2).flat_map(|i| planes.iter().map(move |p| p[i])).collect()] };
++                    let dir = Dir { entries: base(2, 1, 8, 5, 2), chunks, tiled: false }
++                        .tag(278, LONG, &[1])
++                        .tag(284, SHORT, &[if planar { 2 } else { 1 }])
++                        .tag(338, SHORT, &extras);
++                    let file = build(little, big, &[dir], &[0]);
++                    let img = photocraft_codecs::decode(&file.bytes).unwrap();
++                    assert_eq!(img.data(), [10, 20, 30, 0, 40, 50, 60, 127]);
++                    assert_eq!(img.meta.tiff_extra_samples, vec![vec![255, 0]]);
++                }
++            }
++        }
++    }
++}
++
++#[test]
++fn missing_spot_plane_is_an_error_instead_of_a_silent_empty_plate() {
++    use tiffgen::{Dir, LONG, SHORT, base, build};
++    let dir = Dir { entries: base(2, 1, 8, 5, 2), chunks: vec![vec![10, 40], vec![20, 50], vec![30, 60], vec![255, 127], vec![255, 0]], tiled: false }
++        .tag(278, LONG, &[1])
++        .tag(284, SHORT, &[2])
++        .tag(338, SHORT, &[2, 0]);
++    let mut file = build(true, false, &[dir], &[0]);
++    file.bytes.truncate(file.chunk_at[0][4] as usize + 1);
++    assert!(photocraft_codecs::decode(&file.bytes).is_err());
++}
++
++#[test]
++fn cmyk_spot_preserves_four_inks_alpha_and_spot_at_all_depths() {
++    for layout in [ChannelLayout::Cmyk, ChannelLayout::CmykA] {
++        for sample in [SampleType::U8, SampleType::U16, SampleType::F32] {
++            for compression in [TiffCompression::None, TiffCompression::Lzw, TiffCompression::Deflate, TiffCompression::PackBits] {
++                let mut pixels = Vec::new();
++                let mut spot = Vec::new();
++                for i in 0..3 {
++                    for c in 0..layout.channels() {
++                        let value = if c == 4 { i as f32 / 2.0 } else { (i + c) as f32 / 6.0 };
++                        match sample {
++                            SampleType::U8 => pixels.push((value * 255.0).round() as u8),
++                            SampleType::U16 => pixels.extend_from_slice(&((value * 65535.0).round() as u16).to_ne_bytes()),
++                            SampleType::F32 => pixels.extend_from_slice(&value.to_ne_bytes()),
++                            _ => unreachable!(),
++                        }
++                    }
++                    let value = 1.0 - i as f32 / 2.0;
++                    match sample {
++                        SampleType::U8 => spot.push((value * 255.0).round() as u8),
++                        SampleType::U16 => spot.extend_from_slice(&((value * 65535.0).round() as u16).to_ne_bytes()),
++                        SampleType::F32 => spot.extend_from_slice(&value.to_ne_bytes()),
++                        _ => unreachable!(),
++                    }
++                }
++                let image = Image::from_raw(3, 1, layout, sample, pixels.clone()).unwrap();
++                let options = EncodeOptions { tiff_compression: compression, ..Default::default() };
++                let bytes = photocraft_codecs::encode_tiff_spot(&image, &spot, &options).unwrap();
++                let mut raw = Decoder::new(Cursor::new(&bytes)).unwrap();
++                assert_eq!(raw.get_tag_u32(Tag::PhotometricInterpretation).unwrap(), 5);
++                assert_eq!(raw.get_tag_u32(Tag::SamplesPerPixel).unwrap(), if layout.has_alpha() { 6 } else { 5 });
++                assert_eq!(raw.get_tag_u16_vec(Tag::ExtraSamples).unwrap(), if layout.has_alpha() { vec![2, 0] } else { vec![0] });
++                let decoded = photocraft_codecs::decode(&bytes).unwrap();
++                assert_eq!(decoded.layout(), layout);
++                assert_eq!(decoded.data(), pixels);
++                assert_eq!(decoded.meta.tiff_extra_samples, vec![spot]);
++            }
++        }
++    }
++}
+diff --git a/crates/io/src/channel_map.rs b/crates/io/src/channel_map.rs
+index 74e42feb1..b7ad9044d 100644
+--- a/crates/io/src/channel_map.rs
++++ b/crates/io/src/channel_map.rs
+@@ -126,6 +126,23 @@ pub(crate) fn hsb_to_rgb(h: f32, s: f32, v: f32) -> [f32; 3] {
+     }
+ }
+ 
++/// Convert between coverage masks (zero = no ink) and Photoshop spot plates
++/// (maximum = no ink). This operation is its own inverse; alpha is never passed here.
++pub(crate) fn invert_spot_samples(bytes: &mut [u8], sample: photocraft_color::SampleType) {
++    use photocraft_color::SampleType;
++    match sample {
++        SampleType::U8 => bytes.iter_mut().for_each(|v| *v = 255 - *v),
++        SampleType::U16 => bytes.chunks_exact_mut(2).for_each(|v| {
++            let x = u16::from_ne_bytes([v[0], v[1]]);
++            v.copy_from_slice(&(u16::MAX - x).to_ne_bytes());
++        }),
++        SampleType::F32 => bytes.chunks_exact_mut(4).for_each(|v| {
++            let x = f32::from_ne_bytes([v[0], v[1], v[2], v[3]]);
++            v.copy_from_slice(&(1.0 - x).to_ne_bytes());
++        }),
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/crates/io/src/flat.rs b/crates/io/src/flat.rs
+index 7786c2835..27ba61739 100644
+--- a/crates/io/src/flat.rs
++++ b/crates/io/src/flat.rs
+@@ -241,7 +241,10 @@ pub fn import_tiff_page(name: &str, bytes: &[u8], page: Option<usize>) -> Result
+         }
+         return Ok(r);
+     }
+-    image_to_document(name, &img.oriented(orientation)?)
++    let img = img.oriented(orientation)?;
++    let mut r = image_to_document(name, &img)?;
++    crate::tiff_layers::restore_extra_channels(&mut r.document, &img, &mut r.warnings)?;
++    Ok(r)
+ }
+ 
+ /// A decoded flat image as a single-layer document: a locked "Background" when it is opaque, a
+diff --git a/crates/io/src/lib.rs b/crates/io/src/lib.rs
+index 2289670db..c9dfb473c 100644
+--- a/crates/io/src/lib.rs
++++ b/crates/io/src/lib.rs
+@@ -556,7 +556,9 @@ fn export_stages(doc: &Document, name_or_ext: &str, opts: &ExportOptions, ctl: &
+         return Ok(ExportResult { bytes, warnings });
+     }
+     let format = photocraft_codecs::from_extension(&ext).ok_or_else(|| IoError::UnknownFormat(name_or_ext.to_string()))?;
+-    if format == photocraft_codecs::Format::Tiff && opts.tiff_layers && tiff_layers::would_write_layers(doc) {
++    if format == photocraft_codecs::Format::Tiff
++        && ((opts.tiff_layers && tiff_layers::would_write_layers(doc)) || doc.channels.iter().any(|c| c.spot.is_some()))
++    {
+         return tiff_layers::export_layered(doc, opts, ctl);
+     }
+     flat::export_flat_with(doc, format, opts, ctl)
+diff --git a/crates/io/src/psd_export.rs b/crates/io/src/psd_export.rs
+index 6a476c553..b79ed30bb 100644
+--- a/crates/io/src/psd_export.rs
++++ b/crates/io/src/psd_export.rs
+@@ -1747,7 +1747,10 @@ fn document_to_psd_nested(doc: &Document, opts: &PsdExportOptions, depth: u32, c
+     };
+     for a in &extra {
+         let s = if a.surface.format() != ex.mask_fmt { a.surface.convert(ex.mask_fmt) } else { a.surface.clone() };
+-        let bytes = s.to_interleaved(canvas);
++        let mut bytes = s.to_interleaved(canvas);
++        if a.spot.is_some() {
++            crate::channel_map::invert_spot_samples(&mut bytes, sample);
++        }
+         planes.extend(deinterleave(&bytes, 1, sample, &[false]).remove(0));
+     }
+     let channels = (cc + usize::from(has_alpha) + extra.len()) as u16;
+diff --git a/crates/io/src/psd_import.rs b/crates/io/src/psd_import.rs
+index 8e26d99e8..34cf3e027 100644
+--- a/crates/io/src/psd_import.rs
++++ b/crates/io/src/psd_import.rs
+@@ -678,7 +678,7 @@ fn be_to_ne_plane(plane: &[u8], s: SampleType, n: usize) -> Vec<u8> {
+     interleave(&[Some(plane)], &[zero_sample(s)], n, s, &[false])
+ }
+ 
+-fn unicode_names(data: &[u8]) -> Vec<String> {
++pub(crate) fn unicode_names(data: &[u8]) -> Vec<String> {
+     let mut out = Vec::new();
+     let mut at = 0;
+     while at + 4 <= data.len() {
+@@ -1147,6 +1147,14 @@ pub(crate) fn psd_to_document_decoded(
+         } else if let Some(r) = file.resource(crate::channel_map::DISPLAY_INFO_OLD) {
+             crate::channel_map::apply_display_info(&r.data, false, skip, &mut doc.channels);
+         }
++        for channel in &mut doc.channels {
++            if channel.spot.is_some() {
++                let mut bytes = channel.surface.to_interleaved(canvas);
++                crate::channel_map::invert_spot_samples(&mut bytes, depth);
++                channel.surface.write_interleaved(canvas, &bytes);
++                channel.surface.prune();
++            }
++        }
+         // Saved in Quick Mask mode: that channel becomes the document's Quick Mask again.
+         if let Some(r) = file.resource(crate::channel_map::QUICK_MASK_INFO)
+             && r.data.len() >= 2
+diff --git a/crates/io/src/tiff_layers.rs b/crates/io/src/tiff_layers.rs
+index d6c0a845b..612e9e20a 100644
+--- a/crates/io/src/tiff_layers.rs
++++ b/crates/io/src/tiff_layers.rs
+@@ -53,6 +53,7 @@ pub(crate) fn import_layered(name: &str, img: &Image, layers: &[u8]) -> Result<I
+         Ok(v) => v,
+         Err(e) => {
+             let mut r = image_to_document(name, img)?;
++            restore_extra_channels(&mut r.document, img, &mut r.warnings)?;
+             r.warnings.push(format!("the PSD layer data could not be read ({e}); opened flattened"));
+             return Ok(r);
+         }
+@@ -115,6 +116,7 @@ pub(crate) fn import_layered(name: &str, img: &Image, layers: &[u8]) -> Result<I
+         doc.icc_profile = img.icc.clone().map(Arc::new);
+     }
+     doc.metadata.text = img.meta.text.clone();
++    restore_extra_channels(&mut doc, &img, &mut warnings)?;
+     Ok(ImportResult { document: doc, warnings, source_read_only: false, preview_only: false })
+ }
+ 
+@@ -260,17 +262,28 @@ pub(crate) fn export_layered(doc: &Document, opts: &ExportOptions, ctl: &photocr
+     let has_alpha = file.layer_info.as_ref().is_some_and(|l| l.merged_alpha);
+     let channels = cc + usize::from(has_alpha);
+     let extra = usize::from(file.header.channels).saturating_sub(channels);
+-    if extra > 0 {
++    let write_spot = matches!(fmt.mode, ColorMode::Rgb | ColorMode::Cmyk)
++        && extra == 1
++        && doc.channels.len() == 1
++        && doc.channels.first().is_some_and(|c| c.spot.is_some())
++        && doc.quick_mask.is_none();
++    if extra > 0 && !write_spot {
+         warnings.push(format!("{extra} alpha channel(s) are not written to TIFF (one transparency channel only)"));
+     }
+     let sample = csample(fmt.sample);
+     let (w, h) = (doc.size.width, doc.size.height);
+     let cmyk = fmt.mode == ColorMode::Cmyk;
+-    let data = interleave(&file.image_data.data, w, h, channels, cc, sample, cmyk)?;
++    let mut img = if cmyk && write_spot && single_layer(doc).is_some() {
++        // A plain CMYK layer already has the required ink separations. The PSD
++        // composite renders through RGB and can introduce new black ink; use
++        // the existing native flat-image path instead, without touching spots.
++        crate::flat::document_to_image(doc, &mut warnings)?
++    } else {
++        let data = interleave(&file.image_data.data, w, h, channels, cc, sample, cmyk)?;
++        Image::from_raw(w, h, layout_for(fmt.mode, has_alpha), sample, data)?
++    };
+     ctl.check().map_err(|_| IoError::Cancelled)?;
+     ctl.progress(TIFF_COMPOSITE_DONE);
+-    let layout = layout_for(fmt.mode, has_alpha);
+-    let mut img = Image::from_raw(w, h, layout, sample, data)?;
+     img.icc = doc.icc_profile.as_ref().map(|i| i.to_vec());
+     img.meta = codecs::Metadata {
+         // EXIF is deliberately not set here: the tags above carry it as resource 1058 and the
+@@ -281,9 +294,26 @@ pub(crate) fn export_layered(doc: &Document, opts: &ExportOptions, ctl: &photocr
+         text: if opts.xmp == crate::XmpEmbed::All { doc.metadata.text.clone() } else { Vec::new() },
+         dpi: Some((doc.resolution_dpi, doc.resolution_dpi)),
+         photoshop_resources: Some(resources),
+-        photoshop_layers: Some(layers),
++        photoshop_layers: opts.tiff_layers.then_some(layers),
+         ..Default::default()
+     };
++    if write_spot {
++        // Extract an actual decoded merged plane, never a compressed byte offset.
++        let plane_bytes = (w as usize)
++            .checked_mul(h as usize)
++            .and_then(|n| n.checked_mul(sample.bytes()))
++            .ok_or_else(|| IoError::Unsupported("spot plane size overflow".into()))?;
++        let at = channels.checked_mul(plane_bytes).ok_or_else(|| IoError::Unsupported("spot offset overflow".into()))?;
++        let spot = file.image_data.data.get(at..at.saturating_add(plane_bytes)).ok_or_else(|| IoError::Unsupported("missing spot channel pixels".into()))?;
++        let mut native = spot.to_vec();
++        if cfg!(target_endian = "little") {
++            for value in native.chunks_exact_mut(sample.bytes()) {
++                value.reverse();
++            }
++        }
++        let bytes = codecs::encode_tiff_spot(&img, &native, &opts.encode)?;
++        return Ok(ExportResult { bytes, warnings });
++    }
+     encode_image(&img, Format::Tiff, opts, warnings)
+ }
+ 
+@@ -316,6 +346,72 @@ pub fn strip_foreign_order_blocks(file: &mut photocraft_psd::PsdFile) -> Vec<Str
+     warnings
+ }
+ 
++/// Restore non-transparency samples independently of whether layer data exists or is readable.
++pub(crate) fn restore_extra_channels(doc: &mut Document, img: &Image, warnings: &mut Vec<String>) -> Result<(), IoError> {
++    let Some(raw) = img.meta.photoshop_resources.as_deref() else {
++        if !img.meta.tiff_extra_samples.is_empty() {
++            warnings.push("TIFF extra samples have no Photoshop channel metadata; restored as alpha channels".into());
++        }
++        return restore_planes(doc, img, &[], None);
++    };
++    let (resources, w) = resources_from_bytes(raw)?;
++    warnings.extend(w);
++    let mut names = resources.iter().find(|r| r.id == 1045).map(|r| crate::psd_import::unicode_names(&r.data)).unwrap_or_default();
++    if names.is_empty()
++        && let Some(resource) = resources.iter().find(|r| r.id == 1006)
++    {
++        // Older writers may provide only Pascal names. Keep the transparency
++        // record aligned with DisplayInfo instead of treating it as the spot.
++        let mut rest = resource.data.as_slice();
++        while let Some((&length, body)) = rest.split_first() {
++            let Some(name) = body.get(..usize::from(length)) else { break };
++            names.push(name.iter().map(|&byte| char::from(byte)).collect());
++            rest = body.get(usize::from(length)..).unwrap_or_default();
++        }
++    }
++    let display = resources
++        .iter()
++        .find(|r| r.id == crate::channel_map::DISPLAY_INFO)
++        .map(|r| (r.data.as_slice(), true))
++        .or_else(|| resources.iter().find(|r| r.id == crate::channel_map::DISPLAY_INFO_OLD).map(|r| (r.data.as_slice(), false)));
++    restore_planes(doc, img, &names, display)?;
++    Ok(())
++}
++
++fn restore_planes(doc: &mut Document, img: &Image, names: &[String], display: Option<(&[u8], bool)>) -> Result<(), IoError> {
++    use photocraft_doc::AlphaChannel;
++    use photocraft_raster::Surface;
++    let skip = usize::from(img.layout().has_alpha() && names.len() == img.meta.tiff_extra_samples.len() + 1);
++    let fmt = photocraft_color::PixelFormat::new(ColorMode::Grayscale, doc.depth, false);
++    let mut channels = Vec::new();
++    let expected = (doc.size.width as usize)
++        .checked_mul(doc.size.height as usize)
++        .and_then(|n| n.checked_mul(doc.depth.bytes()))
++        .ok_or_else(|| IoError::Unsupported("TIFF extra plane size overflow".into()))?;
++    for (i, plane) in img.meta.tiff_extra_samples.iter().enumerate() {
++        if plane.len() != expected {
++            return Err(IoError::Unsupported("TIFF extra sample depth/size does not match the document".into()));
++        }
++        let mut surface = Surface::new(fmt);
++        surface.write_interleaved(doc.bounds(), plane);
++        surface.prune();
++        channels.push(AlphaChannel::new(names.get(i + skip).cloned().unwrap_or_else(|| format!("Alpha {}", i + 1)), surface));
++    }
++    if let Some((data, versioned)) = display {
++        crate::channel_map::apply_display_info(data, versioned, skip, &mut channels);
++    }
++    for c in &mut channels {
++        if c.spot.is_some() {
++            let mut bytes = c.surface.to_interleaved(doc.bounds());
++            crate::channel_map::invert_spot_samples(&mut bytes, doc.depth);
++            c.surface.write_interleaved(doc.bounds(), &bytes);
++            c.surface.prune();
++        }
++    }
++    doc.channels = channels;
++    Ok(())
++}
++
+ #[cfg(test)]
+ mod tests {
+     use photocraft_doc::{Color, Document, Fill, FillCache, Layer, LayerContent};
+diff --git a/crates/io/tests/tiff_spot.rs b/crates/io/tests/tiff_spot.rs
+new file mode 100644
+index 000000000..87dc4d500
+--- /dev/null
++++ b/crates/io/tests/tiff_spot.rs
+@@ -0,0 +1,205 @@
++//! DTF regression: a spot is a fifth sample, never a second transparency sample.
++use photocraft_color::{Color, ColorMode, PixelFormat, SampleType};
++use photocraft_doc::{AlphaChannel, Document, Layer, LayerContent};
++use photocraft_geom::{Rect, Size};
++use photocraft_io::{ExportOptions, export, import};
++use photocraft_raster::Surface;
++
++fn document(depth: SampleType, transparent: bool) -> Document {
++    let mut doc = Document::new("DTF", Size::new(3, 1), ColorMode::Rgb, depth);
++    let mut art = Surface::new(doc.pixel_format());
++    art.write_region(Rect::new(0, 0, 3, 1), &[1., 0., 0., 1., 0., 1., 0., if transparent { 0.5 } else { 1. }, 0., 0., 1., if transparent { 0. } else { 1. }]);
++    doc.layers.push(Layer::new("Artwork", LayerContent::Raster(art)));
++    let mut plate = Surface::new(PixelFormat::new(ColorMode::Grayscale, depth, false));
++    plate.write_region(doc.bounds(), &[0., 0.5, 1.]);
++    let mut channel = AlphaChannel::new("w1", plate);
++    channel.spot = Some((Color::rgb(1., 1., 1.), 1.));
++    doc.channels.push(channel);
++    doc
++}
++
++fn raster(doc: &Document) -> Vec<u8> {
++    let LayerContent::Raster(surface) = &doc.layers[0].content else { panic!("raster layer expected") };
++    surface.to_interleaved(doc.bounds())
++}
++
++fn assert_spot(a: &Document, b: &Document) {
++    assert_eq!(b.channels.len(), 1);
++    assert_eq!(b.channels[0].name, "w1");
++    assert_eq!(b.channels[0].spot, Some((Color::rgb(1., 1., 1.), 1.)));
++    assert_eq!(a.channels[0].surface.to_interleaved(a.bounds()), b.channels[0].surface.to_interleaved(b.bounds()));
++}
++
++#[test]
++fn rgb_transparency_and_white_spot_roundtrip_all_depths() {
++    for depth in [SampleType::U8, SampleType::U16, SampleType::F32] {
++        for transparent in [false, true] {
++            let doc = document(depth, transparent);
++            for layered in [false, true] {
++                let opts = ExportOptions { tiff_layers: layered, ..Default::default() };
++                let out = export(&doc, "dtf.tif", &opts).unwrap();
++                assert!(out.warnings.is_empty(), "{:?}", out.warnings);
++                let img = photocraft_codecs::decode(&out.bytes).unwrap_or_else(|e| panic!("{depth:?} transparent={transparent} layered={layered}: {e}"));
++                assert_eq!(img.meta.tiff_extra_samples.len(), 1);
++                let plate = &img.meta.tiff_extra_samples[0];
++                match depth {
++                    SampleType::U8 => {
++                        assert_eq!(plate.first(), Some(&255));
++                        assert_eq!(plate.last(), Some(&0));
++                    }
++                    SampleType::U16 => {
++                        assert_eq!(&plate[..2], &u16::MAX.to_ne_bytes());
++                        assert_eq!(&plate[4..], &0u16.to_ne_bytes());
++                    }
++                    SampleType::F32 => {
++                        assert_eq!(&plate[..4], &1f32.to_ne_bytes());
++                        assert_eq!(&plate[8..], &0f32.to_ne_bytes());
++                    }
++                }
++                assert_eq!(img.layout().has_alpha(), transparent);
++                let back = import("dtf.tif", &out.bytes).unwrap();
++                assert!(back.warnings.is_empty(), "{:?}", back.warnings);
++                assert_spot(&doc, &back.document);
++                // Compare RGB and straight transparency against the PSD path, which shares the compositor.
++                let psd = export(&doc, "dtf.psd", &Default::default()).unwrap();
++                let psd_back = import("dtf.psd", &psd.bytes).unwrap().document;
++                assert_spot(&doc, &psd_back);
++                if layered {
++                    assert_eq!(raster(&back.document), raster(&psd_back));
++                } else {
++                    let pixels = |d: &Document| {
++                        let LayerContent::Raster(s) = &d.layers[0].content else { panic!("raster") };
++                        s.read_region(d.bounds())
++                    };
++                    for (a, b) in pixels(&back.document).chunks_exact(4).zip(pixels(&psd_back).chunks_exact(4)) {
++                        assert!((a[3] - b[3]).abs() < 1e-6);
++                        for i in 0..3 {
++                            assert!((a[i] * a[3] - b[i] * b[3]).abs() < 1.0 / 255.0);
++                        }
++                    }
++                }
++            }
++        }
++    }
++}
++
++/// Supplied large oracles remain outside source control. Set PHOTOCRAFT_SPOT_PSD/TIFF
++/// to run this test; absence is an explicit ignored test, not a passing oracle check.
++#[test]
++#[ignore = "requires supplied Photoshop PSD via PHOTOCRAFT_SPOT_PSD"]
++fn supplied_photoshop_psd() {
++    check_reference("PHOTOCRAFT_SPOT_PSD");
++}
++
++#[test]
++#[ignore = "requires supplied Photoshop TIFF via PHOTOCRAFT_SPOT_TIFF"]
++fn supplied_photoshop_tiff() {
++    check_reference("PHOTOCRAFT_SPOT_TIFF");
++}
++
++fn check_reference(var: &str) {
++    let path = std::env::var(var).expect("set the reference path");
++    let bytes = std::fs::read(&path).unwrap();
++    let input = import(&path, &bytes).unwrap();
++    let doc = input.document;
++    assert_eq!(doc.channels.len(), 1);
++    assert_eq!(doc.channels[0].name, "w1");
++    assert_eq!(doc.channels[0].spot, Some((Color::rgb(1., 1., 1.), 1.)));
++    for layered in [false, true] {
++        let out = export(&doc, "reference.tif", &ExportOptions { tiff_layers: layered, ..Default::default() }).unwrap();
++        let back = import("reference.tif", &out.bytes).unwrap();
++        assert_spot(&doc, &back.document);
++        if let Ok(dir) = std::env::var("PHOTOCRAFT_SPOT_OUTPUT") {
++            std::fs::create_dir_all(&dir).unwrap();
++            std::fs::write(format!("{dir}/{var}-{layered}.tif"), out.bytes).unwrap();
++        }
++    }
++}
++
++#[test]
++fn damaged_layer_data_falls_back_to_composite_without_losing_spot() {
++    let doc = document(SampleType::U8, true);
++    let mut out = export(&doc, "dtf.tif", &ExportOptions { tiff_layers: true, ..Default::default() }).unwrap();
++    let signature = photocraft_psd::tiff::SIGNATURE;
++    let at = out.bytes.windows(signature.len()).position(|s| s == signature).unwrap();
++    out.bytes[at] = b'X';
++    let back = import("dtf.tif", &out.bytes).unwrap();
++    assert!(back.warnings.iter().any(|w| w.contains("opened flattened")));
++    assert_spot(&doc, &back.document);
++}
++
++#[test]
++fn cmyk_transparency_and_white_spot_roundtrip_all_depths() {
++    for depth in [SampleType::U8, SampleType::U16, SampleType::F32] {
++        for transparent in [false, true] {
++            let mut doc = Document::new("CMYK DTF", Size::new(3, 1), ColorMode::Cmyk, depth);
++            let mut art = Surface::new(doc.pixel_format());
++            art.write_region(
++                doc.bounds(),
++                &[0., 1., 1., 0., 1., 1., 0., 1., 0., if transparent { 0.5 } else { 1. }, 1., 1., 0., 0., if transparent { 0. } else { 1. }],
++            );
++            doc.layers.push(Layer::new("CMYK artwork", LayerContent::Raster(art)));
++            doc.channels = document(depth, transparent).channels;
++            for layered in [false, true] {
++                let output = export(&doc, "cmyk.tif", &ExportOptions { tiff_layers: layered, ..Default::default() }).unwrap();
++                assert!(output.warnings.is_empty(), "{:?}", output.warnings);
++                let decoded = photocraft_codecs::decode(&output.bytes).unwrap();
++                assert!(decoded.layout().is_cmyk());
++                assert_eq!(decoded.layout().has_alpha(), transparent);
++                assert_eq!(decoded.meta.tiff_extra_samples.len(), 1);
++                let back = import("cmyk.tif", &output.bytes).unwrap();
++                assert!(back.warnings.is_empty(), "{:?}", back.warnings);
++                assert_eq!(back.document.mode, ColorMode::Cmyk);
++                assert_spot(&doc, &back.document);
++                let psd = export(&doc, "cmyk.psd", &Default::default()).unwrap();
++                let psd_back = import("cmyk.psd", &psd.bytes).unwrap();
++                assert_spot(&doc, &psd_back.document);
++                if layered {
++                    assert_eq!(raster(&back.document), raster(&psd_back.document));
++                }
++            }
++        }
++    }
++}
++
++#[test]
++fn legacy_pascal_channel_names_keep_transparency_and_spot_aligned() {
++    let doc = document(SampleType::U8, true);
++    let mut output = export(&doc, "legacy.tif", &ExportOptions { tiff_layers: false, ..Default::default() }).unwrap();
++    // Hide the Unicode-name resource; the Pascal-name resource remains intact.
++    let marker = [b'8', b'B', b'I', b'M', 4, 21]; // 1045
++    let at = output.bytes.windows(marker.len()).position(|b| b == marker).unwrap();
++    output.bytes[at + 4..at + 6].copy_from_slice(&60000u16.to_be_bytes());
++    let back = import("legacy.tif", &output.bytes).unwrap();
++    assert_spot(&doc, &back.document);
++}
++
++#[test]
++fn adding_a_spot_does_not_reseparate_a_plain_cmyk_layer() {
++    for depth in [SampleType::U8, SampleType::U16, SampleType::F32] {
++        let mut doc = Document::new("preserve inks", Size::new(3, 1), ColorMode::Cmyk, depth);
++        let mut art = Surface::new(doc.pixel_format());
++        art.write_region(doc.bounds(), &[0.1, 0.6, 0.9, 0., 1., 0.2, 0.7, 0.9, 0.3, 0.5, 0.4, 0.2, 0.1, 0.8, 0.25]);
++        let expected = art.to_interleaved(doc.bounds());
++        doc.layers.push(Layer::new("native CMYK inks", LayerContent::Raster(art)));
++        doc.channels = document(depth, true).channels;
++        for layered in [false, true] {
++            let output = export(&doc, "inks.tif", &ExportOptions { tiff_layers: layered, ..Default::default() }).unwrap();
++            let decoded = photocraft_codecs::decode(&output.bytes).unwrap();
++            assert_eq!(decoded.data(), expected);
++            let back = import("inks.tif", &output.bytes).unwrap();
++            assert_spot(&doc, &back.document);
++            let restored = raster(&back.document);
++            if depth == SampleType::F32 {
++                // Layered import passes through PSD's 1 - CMYK convention;
++                // subtracting twice can round by a float ULP. File pixels above
++                // must still match the original native samples byte-for-byte.
++                for (a, b) in restored.as_chunks::<4>().0.iter().zip(expected.as_chunks::<4>().0) {
++                    assert!((f32::from_ne_bytes(*a) - f32::from_ne_bytes(*b)).abs() <= f32::EPSILON);
++                }
++            } else {
++                assert_eq!(restored, expected);
++            }
++        }
++    }
++}
+diff --git a/crates/psd/src/tiff.rs b/crates/psd/src/tiff.rs
+index 9a2cfe528..fd223096c 100644
+--- a/crates/psd/src/tiff.rs
++++ b/crates/psd/src/tiff.rs
+@@ -154,6 +154,10 @@ impl ImageSourceData {
+     pub fn to_bytes(&self, order: ByteOrder) -> Result<(Vec<u8>, Vec<String>)> {
+         let version = self.version;
+         let mut body = Vec::new();
++        let before_layers = self.global_blocks.iter().rposition(|b| matches!(&b.key, b"Mtrn" | b"Mt16" | b"Mt32")).map_or(0, |i| i + 1);
++        for b in self.global_blocks.iter().take(before_layers) {
++            b.write(&mut body, version, 4)?;
++        }
+         if let Some(info) = &self.layer_info {
+             // Pad to 4 without cloning the layers (and all their pixel data) just to set `padding`.
+             let pad = info.pad_len(version, 4)?;
+@@ -166,10 +170,14 @@ impl ImageSourceData {
+         // Blocks without explicit padding are padded to 4 as they are written (alignment 4), so
+         // the global mask and blocks are written from the model, without a copy of their data.
+         // The signature stays (a foreign-order marker included).
+-        if let Some(m) = &self.global_layer_mask {
++        // A zero-length PSD global mask section means "no mask". It is not a valid
++        // TIFF LMsk record: readers expect the color, opacity and kind fields there.
++        if let Some(m) = &self.global_layer_mask
++            && !m.data.is_empty()
++        {
+             TaggedBlock::write_parts(&mut body, *b"8BIM", *b"LMsk", &m.data, None, version, 4)?;
+         }
+-        for b in &self.global_blocks {
++        for b in self.global_blocks.iter().skip(before_layers) {
+             b.write(&mut body, version, 4)?;
+         }
+         body.put(&self.trailing);
+@@ -192,7 +200,7 @@ impl ImageSourceData {
+             byte_order: ByteOrder::Big,
+             layer_info: file.layer_info.clone(),
+             layer_info_key: key,
+-            global_layer_mask: file.global_layer_mask.clone(),
++            global_layer_mask: file.global_layer_mask.clone().filter(|m| !m.data.is_empty()),
+             global_blocks: file.global_blocks.clone(),
+             trailing: file.layer_mask_trailing.clone(),
+         }
+@@ -2012,6 +2020,33 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn absent_psd_global_mask_is_not_an_empty_tiff_mask_record() {
++        let mut file = testgen::layered(Version::Psd, ColorMode::Rgb, 8, Compression::Rle);
++        file.global_layer_mask = Some(GlobalLayerMask::default());
++        file.global_blocks.clear();
++        for layer in &mut file.layer_info.as_mut().unwrap().layers {
++            layer.blocks.retain(|b| !UNKNOWN.contains(&&b.key));
++        }
++        for order in [ByteOrder::Big, ByteOrder::Little] {
++            let (bytes, warnings) = ImageSourceData::from_psd(&file).to_bytes(order).unwrap();
++            assert!(warnings.is_empty());
++            let (back, _) = ImageSourceData::from_bytes(&bytes).unwrap();
++            assert!(back.global_layer_mask.is_none());
++            assert_eq!(known(&back).layer_info, known(&ImageSourceData::from_psd(&file)).layer_info);
++        }
++    }
++
++    #[test]
++    fn tiff_transparency_marker_precedes_layer_block() {
++        let file = testgen::layered(Version::Psd, ColorMode::Rgb, 32, Compression::Raw);
++        let mut data = ImageSourceData::from_psd(&file);
++        data.global_blocks = vec![TaggedBlock::new(*b"Mt32", Vec::new())];
++        let bytes = data.to_bytes(ByteOrder::Big).unwrap().0;
++        assert_eq!(bytes.get(36..44), Some(&b"8BIMMt32"[..]));
++        assert_eq!(known(&ImageSourceData::from_bytes(&bytes).unwrap().0).layer_info, known(&data).layer_info);
++    }
++
+     #[test]
+     fn global_layer_mask_block() {
+         let d = ImageSourceData { global_layer_mask: Some(GlobalLayerMask { data: vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 50, 128, 0] }), ..Default::default() };
+diff --git a/docs/tiff-spot-v3.md b/docs/tiff-spot-v3.md
+new file mode 100644
+index 000000000..a46bb5448
+--- /dev/null
++++ b/docs/tiff-spot-v3.md
+@@ -0,0 +1,58 @@
++# TIFF spot-channel repair: PhotoCraft 0.15.1
++
++Based on upstream `28f3c18c0d11d69005d224a0a5d5edc56f1fe858` (workspace
++version 0.15.1). This replaces the previous 0.11/0.10 overlay; it is not a set
++of old source files copied onto the new release. In particular, current DICOM
++and IFF decode dispatch and import-only encode errors remain intact.
++
++## Supported export
++
++One spot channel in RGB or CMYK, with optional transparency, at 8-bit,
++16-bit integer and 32-bit float depths. RGB + transparency + spot has five
++samples; CMYK + transparency + spot has six. Without transparency these have
++four and five samples respectively. TIFF ExtraSamples is `[2, 0]` with straight
++transparency or `[0]` without it. The spot is an unspecified sample identified
++by Photoshop channel metadata, never a second transparency channel.
++
++CMYK TIFF uses separated photometric interpretation. Only its four color
++planes undergo the existing PSD/TIFF CMYK convention conversion. Its alpha
++and spot planes are independent. A single plain CMYK raster layer uses the
++existing native flat-image path, preserving its original C/M/Y/K separations
++instead of sending them through the RGB compositor. A new generic `encode_tiff_spot` entry point
++replaces the old patch-only RGB writer. Source DPI, profiles and layer data
++continue through the existing metadata/export paths.
++
++## Polarity and layers
++
++PhotoCraft's current document model uses coverage: zero = no ink, one = full
++ink. PSD/Photoshop spot planes use the reverse convention. The conversion
++occurs once on PSD import/export; TIFF reuses those exported spot bytes
++without a second inversion and restores coverage on import. The patched PSD
++behavior is preserved across all three supported depths. This does not change
++the painting engine's internal convention or brush behavior.
++
++The Photoshop layer-data repair omits an absent global mask instead of writing
++an empty `LMsk` record, and puts merged-transparency marker blocks before the
++layer block. Existing byte-order and layer channel compression code is reused.
++Newer upstream PSD/PSB and other file-format code is retained.
++
++TIFF import retains extra planes independently of the RGB/CMYK composite,
++restores spot name/color/solidity, and handles layered and flat TIFF. Invalid
++layer data can fall back to composite data while preserving the spot. Legacy
++Pascal names (1006) are used when Unicode names (1045) are absent, keeping
++transparency and DisplayInfo entries aligned. Both modern 1077 and legacy 1007
++display resources are recognized. Missing/truncated spot pixels are errors.
++
++## Verification
++
++Synthetic tests cover RGB and CMYK, opaque/transparent, flat/layered, three
++sample depths, four TIFF compression options, byte order, planar/chunky data,
++orientation, malformed spot buffers, truncated planes, damaged layers and legacy
++channel-name alignment. Supplied real Photoshop PSD/TIFF references are opt-in
++ignored tests, run explicitly with `PHOTOCRAFT_SPOT_PSD` / `PHOTOCRAFT_SPOT_TIFF`.
++Reference artwork is not committed or included in the replacement package.
++
++The build's validation report records executed commands and actual outcomes.
++Adobe Photoshop opening/painting and production RIP output must be checked
++on the user's machine; Rust round trips do not establish real-app acceptance.
++Credit for reporting and real Photoshop/printing testing: @jwinslett1.

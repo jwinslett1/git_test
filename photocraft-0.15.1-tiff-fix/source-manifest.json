@@ -1,0 +1,21 @@
+{
+  "base": "28f3c18c0d11d69005d224a0a5d5edc56f1fe858",
+  "patched_commit": "ecea7d9289d3dc5533384c87e7b9018592115691",
+  "version": "0.15.1",
+  "files": {
+    "crates/codecs/src/codecs/tiff.rs": "daf982880840a673bedb9579c6bd1840e9f2b0bd6d34f163fa7ec818932dc462",
+    "crates/codecs/src/image.rs": "a6506d417cf97731ab97a1d95e2538b29e2cbd9031e7fd8328259a47b279f1a1",
+    "crates/codecs/src/lib.rs": "13813c08a626233e1af1d6b82984e7784002868b6a0b6bd574a91576a26d90f6",
+    "crates/codecs/src/orientation.rs": "3cdbf65e59f99f6f827a0f47db5cd1513b02d3b5d7856df9fe439b2133c6a9c3",
+    "crates/codecs/tests/tiff_spot.rs": "a027560d751d3251c7d25038b0c784a3264e409dd5b7f5973915eb512503355f",
+    "crates/io/src/channel_map.rs": "f4cb3dcd029d8c101ec1081dd7e5de013a0719d601930ff5c74ec9b1b0c36a24",
+    "crates/io/src/flat.rs": "759060b486f4e9bf0bfdc17b7b158eda688703efcf1c496b72a112b04723b6b2",
+    "crates/io/src/lib.rs": "67b365ce5c7e2f027435bf176911d5425b3afd008438856c0c11eafecd46587a",
+    "crates/io/src/psd_export.rs": "ef959c531e92b531ff52dbe2a2985b868d4492fae0e08f4c2cff17c50c049962",
+    "crates/io/src/psd_import.rs": "8d5327cf03309023f021f273cd0a6b2bee537ef51dbf0415aac16ccfd4641c9b",
+    "crates/io/src/tiff_layers.rs": "2031d729a814080212d01556ebbef8f9c905605c55d7c340ec52901c493fb255",
+    "crates/io/tests/tiff_spot.rs": "32bc2d3b8f802f662a62475b9f9dbcae6547c352391ddc2fdc8c174e8fe10424",
+    "crates/psd/src/tiff.rs": "d5e0fef204efbc1153d69b3dc062cbb285eee352081527f4a679cfce263f7570",
+    "docs/tiff-spot-v3.md": "1b22daa1c28deb97faacd2732237f0e433bc7184b2fa56b2e2e20ce86b86fb7c"
+  }
+}

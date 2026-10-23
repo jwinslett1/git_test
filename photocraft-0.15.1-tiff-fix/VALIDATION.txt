@@ -1,0 +1,49 @@
+PhotoCraft 0.15.1 TIFF/CMYK repair -- validation
+Base: 28f3c18c0d11d69005d224a0a5d5edc56f1fe858 (main, workspace version 0.15.1)
+Environment: Linux x86_64, rustc 1.95.0. No Adobe Photoshop/RIP GUI or Windows
+execution was performed here.
+
+PASSED
+cargo check --locked
+cargo test --locked -p photocraft-codecs -p photocraft-io -p photocraft-psd
+  2,148 passed, zero failed, 15 ignored in the normal test configuration.
+cargo clippy --locked -p photocraft-codecs -p photocraft-io -p photocraft-psd --all-targets -- -D warnings
+cargo fmt --all -- --check
+git diff --check
+cargo xtask layers
+  31 crates; no layering violations.
+cargo xtask wasm
+  24 crates passed; optional photocraft-codecs/heif passed.
+  Existing target-specific engine dead-code warnings were emitted.
+
+SUPPLIED REFERENCE TESTS, RUN SEPARATELY
+cargo test --locked -p photocraft-io --test tiff_spot -- --ignored
+with PHOTOCRAFT_SPOT_PSD / PHOTOCRAFT_SPOT_TIFF pointing to the private references:
+  2 passed, zero failed. These two tests are among the 15 normally ignored tests.
+References: PTOtigercreek.psd and Photoshop's cat-CMYK-transparent SPOT COLOR.tif.
+Both layered and composite-only exports were exercised.
+
+INDEPENDENT TIFF READER
+Python tifffile verified both generated CMYK cat exports:
+- Separated CMYK, six samples, ExtraSamples = [2, 0].
+- Transparency and w1 pixels identical to Photoshop source.
+- All four CMYK planes match exactly after converting the export's straight
+  alpha to the source Photoshop file's associated-alpha convention.
+- Fully opaque CMYK pixels match exactly.
+
+REGRESSION COVERAGE
+RGB/CMYK; opaque/transparent; flat/layered; 8-bit, 16-bit and 32-bit float;
+four TIFF compression choices; native CMYK ink preservation; spot polarity;
+legacy channel-name alignment; malformed buffers/truncated planes; orientation;
+planar/chunky and endian variations; damaged-layer composite fallback.
+
+BLOCKED / NOT RUN
+cargo xtask test-corpus -p photocraft-codecs -p photocraft-io -p photocraft-psd
+  The required PngSuite download returned HTTP 403. The external corpus runner
+  stopped before its corpus tests ran. No checksums were bypassed and no tests
+  were disabled. The supplied Photoshop references above were tested separately.
+
+STILL REQUIRES USER VERIFICATION
+Adobe Photoshop reading of new exports, Windows build/run, production RIP output
+and interactive spot painting. The patch does not change brush semantics.
+Private user reference artwork and generated test outputs are not distributed.
